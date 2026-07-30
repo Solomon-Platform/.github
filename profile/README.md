@@ -1,37 +1,91 @@
 # Solomon
 
-Solomon is an AI-native decision workspace for teams: it turns meetings, documents, and signals
-into tracked decisions, follow-up tasks, and reports — with AI personas assisting review instead
-of teams manually chasing every follow-up.
-
-## How it fits together
-
-```mermaid
-flowchart LR
-    subgraph Client["Flutter client (iOS · Android · macOS · Windows · Linux)"]
-        ui["features/*<br/>presentation · domain · data"]
-    end
-
-    subgraph Cloud["Rust Cloud API"]
-        api["API server<br/>meeting state · reports · decisions · permissions"]
-    end
-
-    auth[("Supabase Auth")]
-    llm[("LLM providers")]
-
-    ui -->|REST| api
-    ui -->|session| auth
-    api --> auth
-    api --> llm
-```
-
-The Rust API is the single source of truth for meeting-state transitions, report generation,
-RAG selection, cost limits, and permission checks — the client only renders results, it never
-re-implements those rules.
+Solomon is an AI-native decision workspace for teams. It turns meetings, documents, and incoming
+signals into tracked decisions, follow-up tasks, and reports, with AI personas assisting review
+instead of people manually chasing every follow-up.
 
 ## Core loop
 
-Connect sources → collect signals → review → decide / assign tasks → track → report → automate.
+```mermaid
+flowchart LR
+    a["Connect sources<br/><sub>docs, meetings, chat</sub>"] --> b["Collect signals"]
+    b --> c["Review<br/><sub>AI-assisted</sub>"]
+    c --> d["Decide / assign tasks"]
+    d --> e["Track"]
+    e --> f["Report"]
+    f --> g["Automate"]
+    g -.->|feeds back| a
+```
+
+Everything under "Decide / assign" produces a **decision** or a **directive** (task) that stays
+attached to the meeting/document it came from, so reports are always traceable back to source.
+
+## System architecture
+
+Client and server are both organized as layered/Clean Architecture, so the domain rules on each
+side stay independent of frameworks (Flutter, Axum, Postgres).
+
+```mermaid
+flowchart TB
+    subgraph Client["Flutter client — iOS · Android · macOS · Windows · Linux"]
+        direction TB
+        cpres["presentation<br/><sub>widgets, Riverpod providers</sub>"]
+        cdomain["domain<br/><sub>pure Dart, no framework deps</sub>"]
+        cdata["data<br/><sub>repositories, API client</sub>"]
+        cpres --> cdomain
+        cdata --> cdomain
+    end
+
+    subgraph Server["Rust Cloud API — Cargo workspace"]
+        direction TB
+        api["api<br/><sub>axum HTTP layer</sub>"]
+        app["application<br/><sub>use cases, orchestration</sub>"]
+        domain["domain<br/><sub>pure business rules</sub>"]
+        pg["postgres<br/><sub>sqlx repositories</sub>"]
+        worker["worker<br/><sub>background jobs</sub>"]
+        api --> app --> domain
+        pg --> domain
+        worker --> app
+    end
+
+    auth[("Supabase Auth")]
+    db[("Postgres")]
+    llm[("LLM providers")]
+
+    cdata -->|REST, bearer token| api
+    cdata -->|session / PKCE| auth
+    api -->|verifies JWT| auth
+    pg --> db
+    app --> llm
+```
+
+**Authority stays server-side.** Meeting-state transitions, report generation rules, RAG
+selection, cost limits, and permission checks live only in the Rust `domain`/`application`
+crates — the Flutter client never re-implements them, it renders whatever the API returns. A
+client-supplied `workspace_id`, `user_id`, role, or cost estimate is never treated as an
+authorization source by the server.
+
+## Features
+
+| Area | What it does |
+|---|---|
+| Meetings | Run/record meetings, AI persona review, extract decisions & follow-ups |
+| Decisions | Structured decisions with the framework/rationale behind each one |
+| Directives | Tasks generated from meetings/decisions, owner + due date tracked |
+| Documents | Source documents connected as review/report input |
+| Reports | Generated from tracked decisions/directives, traceable to source |
+| Agents | AI personas that assist review and can be published for reuse |
+| Dashboard | Workspace-level signal & activity overview |
+
+## Tech stack
+
+| Layer | Stack |
+|---|---|
+| Client | Flutter, Dart, Riverpod (state/DI), Clean Architecture |
+| Server | Rust, Axum (HTTP), sqlx (Postgres), Tokio |
+| Auth | Supabase Auth (JWT), PKCE flow on the client |
+| Data | Postgres |
+| AI | LLM-backed meeting personas, RAG over connected documents |
 
 ## Repositories
 
