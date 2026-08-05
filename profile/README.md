@@ -65,6 +65,71 @@ crates — the Flutter client never re-implements them, it renders whatever the 
 client-supplied `workspace_id`, `user_id`, role, or cost estimate is never treated as an
 authorization source by the server.
 
+## AI review engine (conceptual)
+
+None of this code is public — this diagrams the *shape* of the system, not the implementation.
+The model never writes state directly: it proposes a transition, and a total guard function
+either accepts it and persists the next state, or rejects it outright.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Intake
+    Intake --> Analysis : sources attached
+    Analysis --> Review : ready for AI review
+    Review --> Gate : structured findings validated
+    Gate --> Decided : guard accepts transition
+    Gate --> Rejected : guard rejects transition
+    Analysis --> BlockedEvidence : insufficient evidence
+    BlockedEvidence --> Analysis : evidence resumed
+    Review --> BlockedModel : model backend unavailable
+    BlockedModel --> Review : backend resumed
+    Decided --> [*]
+    Rejected --> [*]
+
+    note right of Gate
+        Every transition is either
+        accepted and persisted, or
+        rejected — no partial writes,
+        no trusting model output as-is.
+    end note
+```
+
+Reviews themselves are structured, multi-axis findings validated against a fixed schema before
+they're allowed near the guard — malformed or out-of-range output is a hard rejection, not a
+best-effort parse. Job processing is safe under concurrency, and every accepted transition is
+content-addressed so what the model saw and what it decided are both reconstructable later:
+
+```mermaid
+sequenceDiagram
+    participant Worker
+    participant Queue as Postgres job queue
+    participant LLM as LLM provider
+    participant Guard as State guard
+    participant DB as Postgres (state of record)
+
+    Worker->>Queue: claim job (row-level lock, skip already-claimed)
+    Queue-->>Worker: job leased
+    loop heartbeat while processing
+        Worker->>Queue: extend lease
+    end
+    Worker->>LLM: request structured review (schema-constrained)
+    LLM-->>Worker: multi-axis findings (typed, not free text)
+    Worker->>Worker: validate against policy schema
+    alt malformed or out-of-range
+        Worker->>Queue: checkpoint: reject, no state write
+    else valid
+        Worker->>Guard: propose transition(current_state, findings)
+        Guard-->>Worker: accept(next_state) or reject(reason)
+        Worker->>DB: canonicalize (RFC 8785 JCS) + SHA-256 hash the evidence
+        Worker->>DB: persist next_state under optimistic concurrency control
+    end
+    Worker->>Queue: release lease
+```
+
+The interesting engineering problem isn't "call an LLM" — it's constraining what an LLM's output
+is allowed to do to a system of record, and making every step of that auditable. The specific
+review axes, approval-policy thresholds, and prompts are the actual product and stay closed.
+
 ## Features
 
 | Area | What it does |
@@ -91,4 +156,5 @@ authorization source by the server.
 
 | Repo | What it is |
 |---|---|
-| [`solomon`](https://github.com/Solomon-Platform/solomon) | Monorepo: Flutter client + Rust Cloud API |
+| [`solomon`](https://github.com/Solomon-Platform/solomon) | Monorepo: Flutter client + Rust Cloud API (private) |
+| [`solomon-workspace-ui`](https://github.com/Solomon-Platform/solomon-workspace-ui) | Offline UI shell extracted from the client — no backend, in-memory fixtures only |
