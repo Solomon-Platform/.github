@@ -1,8 +1,10 @@
 # Solomon
 
-Solomon is an AI-native decision workspace for teams. It turns meetings, documents, and incoming
-signals into tracked decisions, follow-up tasks, and reports, with AI personas assisting review
-instead of people manually chasing every follow-up.
+Decisions made in a meeting live in someone's notes, if they're written down at all, and
+follow-ups fall through because no system tracks whether they actually happened. Solomon is an
+AI-native decision workspace for teams: it turns meetings, documents, and incoming signals into
+tracked decisions, follow-up tasks, and reports, with AI personas assisting review instead of
+people manually chasing every follow-up.
 
 ## Core loop
 
@@ -19,6 +21,33 @@ flowchart LR
 
 Everything under "Decide / assign" produces a **decision** or a **directive** (task) that stays
 attached to the meeting/document it came from, so reports are always traceable back to source.
+
+## Data model
+
+A decision or directive always keeps a pointer back to the meeting or document that produced it,
+and a report is assembled from that trail — not from someone's memory of what was said.
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        m["Meeting"]
+        doc["Document"]
+    end
+    subgraph Outputs
+        dec["Decision<br/><sub>framework + rationale</sub>"]
+        dir["Directive<br/><sub>owner + due date</sub>"]
+    end
+    rep["Report"]
+
+    m --> dec
+    m --> dir
+    doc --> dec
+    doc --> dir
+    dec --> rep
+    dir --> rep
+    rep -.->|traceable to source| m
+    rep -.->|traceable to source| doc
+```
 
 ## System architecture
 
@@ -132,6 +161,8 @@ review axes, approval-policy thresholds, and prompts are the actual product and 
 
 ## Features
 
+What this gives a team end to end:
+
 | Area | What it does |
 |---|---|
 | Meetings | Run/record meetings, AI persona review, extract decisions & follow-ups |
@@ -163,3 +194,4 @@ review axes, approval-policy thresholds, and prompts are the actual product and 
 | [`openrouter_dart`](https://github.com/Solomon-Platform/openrouter_dart) | OpenRouter client (Dart) — tool-calling loop with parallel execution + reasoning-model recovery, plus a Tavily search client |
 | [`jwks-verifier`](https://github.com/Solomon-Platform/jwks-verifier) | JWKS JWT verifier (Rust) — the auth boundary in front of the API above, framework-agnostic |
 | [`idempotency-key`](https://github.com/Solomon-Platform/idempotency-key) | Idempotency-Key handling (Rust) — the header validation/request-hash pair behind the API's mutation endpoints |
+| [`rubric-loop`](https://github.com/Solomon-Platform/rubric-loop) | Ten Rust CLIs for domain-specific content generation/review (SEO, GEO, ASO, marketing copy, PR review, app-store creative, icon design, business plans, secret-scan triage) — standalone tooling, not part of the Solomon product |
