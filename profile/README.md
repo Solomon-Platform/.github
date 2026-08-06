@@ -833,6 +833,245 @@ flowchart LR
 }
 ```
 
+### Further implementation detail
+
+Schema and policy examples for the earliest roadmap phases.
+
+LLM Gateway as an internal-only interface — application code never calls a model provider
+directly:
+
+```
+POST /v1/decisions/chat
+POST /v1/decisions/embeddings
+POST /v1/decisions/rerank
+POST /v1/decisions/tools/continue
+```
+
+Policy Engine, as a Cedar/OPA-style rule:
+
+```
+permit(subject, action, resource)
+when {
+  subject.clearance >= resource.classification
+  && subject.department in resource.allowed_departments
+  && context.purpose in resource.allowed_purposes
+  && (
+    model.zone == "LOCAL"
+    || resource.external_egress == true
+  )
+};
+```
+
+A policy decision is never a bare boolean — it always carries obligations:
+
+```json
+{
+  "decision": "ALLOW_WITH_OBLIGATIONS",
+  "policy_version": "policy-42",
+  "obligations": [
+    "MASK:person.ssn",
+    "MODEL_ZONE:LOCAL",
+    "APPROVAL:TIER_2",
+    "LOG_MODE:METADATA_ONLY"
+  ],
+  "reason_codes": [
+    "PII_PRESENT",
+    "EXTERNAL_EGRESS_DENIED"
+  ]
+}
+```
+
+Security Gateway inspection returns an obligation set, not just allow/block: `FORCE_LOCAL_MODEL`
+· `MASK_PII` · `REMOVE_ATTACHMENT` · `DISABLE_TOOLS` · `REQUIRE_APPROVAL` · `NO_PERSISTENCE` ·
+`REDACT_LOG` · `MAX_CONTEXT_CLASSIFICATION=INTERNAL`.
+
+Minimum SQLite schema for an MVP permission engine:
+
+```sql
+CREATE TABLE subjects (
+  subject_id TEXT PRIMARY KEY,
+  attributes_json TEXT NOT NULL,
+  version INTEGER NOT NULL
+);
+CREATE TABLE roles (role_id TEXT PRIMARY KEY);
+CREATE TABLE subject_roles (
+  subject_id TEXT,
+  role_id TEXT,
+  valid_from TEXT,
+  valid_to TEXT
+);
+CREATE TABLE resources (
+  resource_id TEXT PRIMARY KEY,
+  resource_type TEXT,
+  classification INTEGER,
+  owner_id TEXT,
+  attributes_json TEXT
+);
+CREATE TABLE object_policies (
+  policy_id TEXT PRIMARY KEY,
+  object_type TEXT,
+  expression TEXT,
+  version INTEGER
+);
+CREATE TABLE field_policies (
+  policy_id TEXT PRIMARY KEY,
+  object_type TEXT,
+  field_name TEXT,
+  expression TEXT,
+  mask_strategy TEXT
+);
+CREATE TABLE policy_decisions (
+  decision_id TEXT PRIMARY KEY,
+  subject_id TEXT,
+  resource_id TEXT,
+  action TEXT,
+  decision TEXT,
+  policy_version TEXT,
+  obligations_json TEXT,
+  created_at TEXT
+);
+```
+
+Action definition and the full Action lifecycle:
+
+```rust
+struct ActionDefinition {
+    action_type: String,
+    input_schema: serde_json::Value,
+    required_permissions: Vec<String>,
+    risk_tier: u8,
+    approval_policy: String,
+    idempotency_required: bool,
+    dry_run_supported: bool,
+    compensation_action: Option<String>,
+    external_side_effect: bool,
+}
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Draft
+    Draft --> Validated: passes schema, permission, policy
+    Draft --> Failed: schema/permission/policy failure
+    Validated --> ApprovalRequired: risk_tier >= threshold
+    Validated --> Executable: low risk, auto-approved
+    ApprovalRequired --> Executable: approved
+    ApprovalRequired --> Rejected: rejected
+    Executable --> Executing
+    Executing --> Completed
+    Executing --> Failed
+    Completed --> [*]
+    Failed --> Compensating: compensation requested
+    Compensating --> Compensated
+    Compensated --> [*]
+    Rejected --> [*]
+```
+
+An LLM only ever produces an `ActionProposal` — it never holds connector credentials directly;
+the Action Engine executes with a short-lived capability token instead.
+
+Decision Ontology invariants beyond the object model above: an unapproved decision can never
+create an irreversible action; every recommendation needs at least one Claim; a Verified Claim
+needs versioned Evidence; Claims produced by a model default to Unverified; when Evidence is
+deleted or withdrawn, its Claims become Stale; and reusing a past decision preserves the original
+policy, model, and evidence version rather than silently re-evaluating against current state.
+
+Decision Memory, split by type rather than one conversation log:
+
+| Memory type | Content | Retention |
+|---|---|---|
+| Working | Current request's temporary state | Session |
+| Episodic | Past decisions and situations | By policy, permission-scoped on retrieval |
+| Semantic | Verified organizational knowledge | Source-linked, long-lived |
+| Procedural | Approved playbooks and policy | Versioned |
+| Outcome | Actual results after a decision | Long-term, for analysis |
+| Personal | User preferences | Only on explicit consent |
+
+Evidence Graph edge types: `CLAIM_SUPPORTED_BY_EVIDENCE` · `CLAIM_CONTRADICTED_BY_EVIDENCE` ·
+`DECISION_DEPENDS_ON_ASSUMPTION` · `ACTION_JUSTIFIED_BY_DECISION` · `EVIDENCE_DERIVED_FROM_SOURCE`
+· `SOURCE_SUPERSEDES_SOURCE` · `POLICY_ALLOWED_CONTEXT` · `MODEL_GENERATED_CLAIM` ·
+`HUMAN_VERIFIED_CLAIM` — enough to answer "which document *section* backed this claim," not just
+"which document was used."
+
+Risk Engine separates deterministic checks from model-assisted ones — the model never gets final
+sign-off on its own risk score:
+
+| Risk factor | Deterministic check | Model-assisted |
+|---|---|---|
+| Data classification | Yes | Not needed |
+| External egress | Yes | Not needed |
+| User clearance | Yes | Not needed |
+| Tool allow-list | Yes | Not needed |
+| PII pattern | Yes | Entity extraction can supplement |
+| Prompt injection | Signature/heuristic | Classifier can assist |
+| Evidence fidelity | Source ID presence | NLI/LLM-judge can assist |
+| Action impact | Action catalog description | Can assist |
+| Unusual request rate | Rule-based | Anomaly model can assist |
+
+Model Router priority order — security is evaluated before cost, and fallback only stays within
+the same or a stricter security zone: security zone/residency → model capability → user/org
+allow-list → allowed data egress → latency → quality → cost → availability.
+
+Multi-agent: never give an agent its own long-lived API key — issue a per-request capability
+token carrying allowed tools, object scope, max classification, and a token/cost/time budget.
+Shared memory between agents is permission-checked artifacts, not a raw conversation dump.
+
+### Known vulnerabilities and legal considerations
+
+Palantir's own incident record and compliance posture, plus what a Korean deployment specifically
+has to check — from a separate deep-dive on data exposure and cross-border transfer.
+
+**Known vulnerabilities and incidents** (public record, not hypothetical):
+
+- **CVE-2023-22833** — a Foundry Lime2 access-control bypass that let authenticated users exceed
+  discretionary/mandatory access controls under certain conditions (NVD, high confidentiality
+  impact).
+- **PLTRSEC-2022-09** — Gotham Chat's IRC helper failed to validate TLS certificate hostnames,
+  letting a privileged-network attacker read or alter traffic; patched via Apollo's automatic
+  update channel.
+- A 2021 media report (TechCrunch) described FBI staff retaining unauthorized access to
+  investigative material through a Palantir-built system for an extended period — based on
+  reporting, not an official disclosure, so the exact defect and scope aren't independently
+  confirmable from public sources alone.
+
+None of these are LLM-specific, but the pattern is worth carrying into Solomon's own threat
+model: fine-grained access control can still be bypassed by implementation bugs or
+misconfiguration, "the policy exists" isn't the same as "every service enforces it correctly,"
+and an absence of public incident reports isn't evidence that no incidents occurred.
+
+**Compliance posture** (Palantir Trust Portal): ISO 27001/27017/27018, SOC 1/2, FedRAMP High,
+FISMA High, DoD IL5/IL6, and HIPAA BAA support are listed. None of this automatically guarantees a
+given deployment is compliant — scope, region, model provider, and log handling still have to be
+verified per contract; SOC 2 attests to controls over a specific period and scope, not the
+absence of any possible breach.
+
+**Cross-border transfer under Korea's PIPA** — directly relevant for a Korean-built product.
+Korea's Personal Information Protection Act treats overseas *viewing or processing* of personal
+data as a transfer, not just storage — so routing a prompt containing Korean users' personal data
+to a US/EU model endpoint is likely subject to overseas-transfer review even when the provider
+never retains it. "Deleted immediately after processing" reduces retention risk but doesn't
+remove the transfer/processing event itself. PIPC's 2025 generative-AI guidance covers legal
+basis and safeguards across the full pipeline for both commercial and open-source models, and
+PIPC's 2025 review of DeepSeek treated user prompts as subject to overseas-transfer rules — a
+concrete signal that "the prompt is just technical data" isn't a safe assumption.
+
+Minimum review items before sending Korean personal data through any external model: purpose and
+minimum-necessary collection (only pass the objects/fields actually needed); the processor and
+sub-processor chain (Palantir, cloud, model provider); destination country, legal basis, transfer
+method, retention period; access control, encryption, and access-log evidence; separate handling
+for pseudonymized data used in research/statistics; whether data-subject rights (access,
+correction, deletion, processing suspension) reach prompts, logs, vectors, and eval sets — not
+just the primary database; and a deletion policy across sessions, logs, caches, and backups, not
+just the "no model retention" claim.
+
+**Pre-contract due diligence** — what to actually ask a vendor for, not just accept a
+certification list: is the LLM proxy path included in the latest pentest scope; was prompt
+injection / data extraction tested (GenAI red-team results); was tenant isolation verified across
+org/project/marking boundaries; is external-provider zero-data-retention backed by a signed
+agreement rather than just a claim; were log-permission vulnerabilities tested; was BYOM /
+self-hosted model container isolation, egress, and supply chain tested; and what's the open
+critical-finding list with CVSS scores and remediation dates.
+
 ### Multi-agent adoption criteria
 
 Multi-agent should be a way to **separate permissions, tools, budget, and responsibility** — not
@@ -982,8 +1221,101 @@ flowchart TB
 **control-plane-centric architecture** that keeps a non-deterministic model inside existing data,
 permission, action, and audit systems.
 
-Full source material (research methodology in more depth, source citations, original document
-composition): private `solomon` repo, `docs/palantir-llm-security-architecture.md`.
+### References
+
+Every "Verified Fact" claim above traces back to one of these. Confirmation date for all: 2026-08-06.
+
+<details>
+<summary>Palantir official documentation (click to expand)</summary>
+
+- [AIP architecture](https://palantir.com/docs/foundry/architecture-center/aip-architecture/)
+- [Platform architecture](https://palantir.com/docs/foundry/architecture-center/platforms/)
+- [Architecture overview](https://palantir.com/docs/foundry/architecture-center/overview/)
+- [Ontology overview](https://palantir.com/docs/foundry/ontology/overview/)
+- [Ontology system](https://palantir.com/docs/foundry/architecture-center/ontology-system/)
+- [Ontology-augmented generation](https://palantir.com/docs/foundry/ontology/ontology-augmented-generation/)
+- [Semantic search workflow](https://palantir.com/docs/foundry/ontology/using-palantir-provided-models-to-create-a-semantic-search-workflow/)
+- [AIP security and privacy](https://palantir.com/docs/foundry/aip/aip-security/)
+- [Security overview](https://palantir.com/docs/foundry/security/overview/)
+- [Object security policies](https://palantir.com/docs/foundry/object-permissioning/object-security-policies/)
+- [Managing object security](https://palantir.com/docs/foundry/object-permissioning/managing-object-security/)
+- [Ontology permissions](https://palantir.com/docs/foundry/object-permissioning/ontology-permissions/)
+- [Restricted views](https://palantir.com/docs/foundry/security/restricted-views/)
+- [Protecting sensitive data](https://palantir.com/docs/foundry/security/protecting-sensitive-data/)
+- [Data protection and governance](https://palantir.com/docs/foundry/security/data-protection-and-governance/)
+- [Sensitive Data Scanner overview](https://palantir.com/docs/foundry/sensitive-data-scanner/overview/)
+- [Retrieval context](https://palantir.com/docs/foundry/chatbot-studio/retrieval-context/)
+- [Chatbot Studio tools](https://palantir.com/docs/foundry/chatbot-studio/tools/)
+- [Chatbot Studio core concepts](https://palantir.com/docs/foundry/chatbot-studio/core-concepts/)
+- [Chatbot Studio getting started](https://palantir.com/docs/foundry/chatbot-studio/getting-started)
+- [Citations](https://palantir.com/docs/foundry/chatbot-studio/citations/)
+- [Session logging](https://www.palantir.com/docs/foundry/chatbot-studio/session-logging)
+- [Get session RAG context](https://palantir.com/docs/foundry/api/aip-agents-v2-resources/sessions/get-rag-context-for-session/)
+- [Get session trace](https://palantir.com/docs/foundry/api/aip-agents-v2-resources/session-traces/get-session-trace/)
+- [Action types overview](https://palantir.com/docs/foundry/action-types/overview/)
+- [Action type permissions](https://palantir.com/docs/foundry/action-types/permissions/)
+- [Submission criteria](https://palantir.com/docs/foundry/action-types/submission-criteria/)
+- [Approvals overview](https://palantir.com/docs/foundry/approvals/overview/)
+- [Checkpoints core concepts](https://palantir.com/docs/foundry/checkpoints/core-concepts/)
+- [Machinery overview](https://palantir.com/docs/foundry/machinery/overview/)
+- [Automate history, visibility, scope](https://palantir.com/docs/foundry/automate/history-visibility-and-scope/)
+- [AIP Logic FAQ](https://palantir.com/docs/foundry/logic/faq/)
+- [AI FDE security and governance](https://palantir.com/docs/foundry/ai-fde/security-and-governance/)
+- [Bring your own model](https://palantir.com/docs/foundry/aip/bring-your-own-model/)
+- [Compute-module-backed models](https://palantir.com/docs/foundry/aip/compute-module-backed-models/)
+- [LLM-provider compatible APIs](https://palantir.com/docs/foundry/aip/llm-provider-compatible-apis/)
+- [Supported LLMs](https://palantir.com/docs/foundry/aip/supported-llms/)
+- [Enable AIP features](https://palantir.com/docs/foundry/aip/enable-aip-features/)
+- [Build a proxy or federation layer](https://palantir.com/docs/foundry/aip/build-a-proxy-or-federation-layer/)
+- [LLM capacity management](https://palantir.com/docs/foundry/aip/llm-capacity-management/)
+- [OpenAI embeddings proxy](https://palantir.com/docs/foundry/api/llm-apis/models/openai-embeddings-proxy/)
+- [Anthropic messages proxy](https://palantir.com/docs/foundry/api/llm-apis/models/anthropic-messages-proxy/)
+- [Model deprecation](https://palantir.com/docs/foundry/model-catalog/model-deprecation/)
+- [Object backend overview](https://palantir.com/docs/foundry/object-backend/overview/)
+- [Data connection architecture](https://palantir.com/docs/foundry/data-connection/architecture/)
+- [Datasets](https://palantir.com/docs/foundry/data-integration/datasets/)
+- [Data integration overview](https://palantir.com/docs/foundry/data-integration/overview/)
+- [Virtual tables](https://palantir.com/docs/foundry/data-integration/virtual-tables/)
+- [Enable Gotham integration](https://palantir.com/docs/foundry/object-link-types/enable-gotham-integration/)
+- [Gotham platform](https://www.palantir.com/platforms/gotham/)
+- [AIP for Defense](https://www.palantir.com/platforms/aip/defense/)
+- [Configure network egress](https://palantir.com/docs/foundry/administration/configure-egress/)
+- [Configure logging](https://palantir.com/docs/foundry/administration/configure-logging/)
+- [Audit logs overview](https://palantir.com/docs/foundry/security/audit-logs-overview/)
+- [AIP observability log permissioning](https://palantir.com/docs/foundry/aip-observability/log-permissioning/)
+- [AWS PrivateLink](https://palantir.com/docs/foundry/private-link/aws-private-link/)
+- [Azure Private Link](https://palantir.com/docs/foundry/private-link/azure-private-link/)
+- [Protect a Foundry installation](https://palantir.com/docs/foundry/security/protect-foundry-installation/)
+- [Apollo introduction](https://palantir.com/docs/apollo/core/introduction/)
+- [Apollo what's new](https://palantir.com/docs/apollo/core/whats-new/)
+- [Apollo connect a new environment](https://palantir.com/docs/apollo/managing-environments/connect-new-environment/)
+- [Apollo remediating vulnerabilities](https://www.palantir.com/docs/apollo/managing-vulnerabilities/remediating-vulnerabilities)
+- [AIP Evals — run a suite](https://palantir.com/docs/foundry/aip-evals/run-suite/)
+- [AIP Assist (KR)](https://www.palantir.com/docs/kr/foundry/platform-overview/aip-assist)
+
+</details>
+
+<details>
+<summary>Security, legal, and incident references (click to expand)</summary>
+
+- [OWASP LLM01: Prompt Injection](https://genai.owasp.org/llmrisk/llm01-prompt-injection/)
+- [Palantir Trust Center](https://palantir.safebase.us/)
+- [NVD — CVE-2023-22833](https://nvd.nist.gov/vuln/detail/CVE-2023-22833)
+- [Palantir security bulletins — PLTRSEC-2022-09](https://github.com/palantir/security-bulletins/blob/main/PLTRSEC-2022-09.md)
+- [TechCrunch — FBI/Palantir unauthorized access report (2021)](https://techcrunch.com/2021/08/26/palantir-glitch-allegedly-granted-some-fbi-staff-unauthorized-access-to-a-crypto-hackers-data/)
+- [Privacy-enhancing technologies adoption guide (Palantir blog)](https://blog.palantir.com/privacy-enhancing-technologies-pets-an-adoption-guide-palantir-rfx-blog-series-6-b02dad56e9da)
+- [Deploying across security domains (Palantir blog)](https://blog.palantir.com/deploying-across-security-domains-449c786d92c0)
+- [US Patent 12405983B1 — ontology-based database interaction via ML](https://patents.google.com/patent/US12405983B1/en)
+- [US Patent 9857960B1 — data collaboration between entities](https://patents.google.com/patent/US9857960B1/en)
+- [Palantir/Anthropic/AWS — Claude for US government (2024)](https://investors.palantir.com/news-details/2024/Anthropic-and-Palantir-Partner-to-Bring-Claude-AI-Models-to-AWS-for-U.S.-Government-Intelligence-and-Defense-Operations/)
+- [Palantir/Eaton partnership (2024)](https://investors.palantir.com/news-details/2024/Eaton-Deepens-Partnership-with-Palantir-to-Enhance-AI-Use-in-Operations/)
+- [Korea PIPC — generative AI personal-data guidance](https://www.pipc.go.kr/np/cop/bbs/)
+- [Korea Personal Information Protection Act — enforcement decree](https://www.law.go.kr/lumLsLinkPop.do?chrClsCd=010202&lspttninfSeq=66999)
+
+</details>
+
+Full source material (original research reports this page distills): private `solomon` repo,
+`docs/palantir-llm-security-architecture.md`.
 
 ## Features
 
