@@ -159,6 +159,89 @@ The interesting engineering problem isn't "call an LLM" — it's constraining wh
 is allowed to do to a system of record, and making every step of that auditable. The specific
 review axes, approval-policy thresholds, and prompts are the actual product and stay closed.
 
+## Security & control-plane architecture
+
+The core principle: an LLM is not a security boundary. Authorization has to be enforced by
+identity, policy, and permission checks around the model, not by describing permissions in the
+prompt and hoping. This reframes a reverse-engineered analysis of Palantir's publicly documented
+LLM security architecture (Foundry/AIP identity, policy, audit) as Solomon's target control
+plane.
+
+```mermaid
+flowchart LR
+    subgraph Trusted["Enterprise control plane"]
+        ID["Identity / Session"]
+        POL["Policy + Permission"]
+        CTX["Authorized Context"]
+        TOOL["Tool Broker"]
+        ACT["Action Engine"]
+        HITL["Human Approval"]
+        AUD["Audit"]
+    end
+    subgraph NonDet["Non-deterministic zone"]
+        LLM["LLM"]
+    end
+
+    ID --> POL --> CTX --> LLM
+    LLM --> TOOL --> POL
+    TOOL --> ACT --> HITL --> AUD
+    CTX --> AUD
+
+    classDef trusted fill:#e8f7f5,stroke:#168b86,color:#102a2a;
+    classDef model fill:#fff4df,stroke:#d88a00,color:#3b2600;
+    class ID,POL,CTX,TOOL,ACT,HITL,AUD trusted;
+    class LLM model;
+```
+
+Design invariants:
+
+- Retrieval and tool calls always pass a server-side permission check — describing a user's
+  permissions in the prompt is not enforcement.
+- Tool arguments the model proposes are re-validated against schema and policy, never trusted
+  as-is.
+- Writes are typed actions, not free text: schema validation, risk check, approval, idempotency,
+  and rollback — the same shape as the state guard above.
+- Every material decision links back to user, session, policy version, model version, and
+  evidence.
+
+Target control plane:
+
+```mermaid
+flowchart TB
+    subgraph Control["Control plane"]
+        POLICY["Policy Engine"]
+        PERM["Permission Engine"]
+        AUDIT["Audit Service"]
+    end
+    subgraph Knowledge["Context"]
+        CONTEXT["Context Builder"]
+        EVIDENCE["Evidence Graph"]
+    end
+    subgraph Execution["Governed execution"]
+        BROKER["Tool Broker"]
+        ACTION["Action Engine"]
+        APPROVAL["Human Approval"]
+    end
+
+    AUTH["Identity / Session"] --> POLICY
+    POLICY <--> PERM
+    POLICY --> CONTEXT --> EVIDENCE
+    CONTEXT --> LLMGW["LLM Gateway"] --> BROKER --> POLICY
+    BROKER --> ACTION --> APPROVAL --> ACTION
+    ACTION --> AUDIT
+    CONTEXT --> AUDIT
+```
+
+| Adopt now — cheap, fits the current single-user local build | Defer — needs a server that's the system of record |
+|---|---|
+| Typed Action + approval: the meeting → decision → approve → execute flow above already has this shape, just needs formalizing | Identity propagation across a multi-tenant server |
+| Audit trace: policy/prompt/model version + evidence hash per decision | Ontology-style permission scoping per object/property |
+| | Tool Broker with server-side re-authorization |
+| | Context Builder with redaction/minimization before the model sees anything |
+
+Full write-up — research methodology, threat model, deployment topology decision tree, interface
+contracts — lives in the private `solomon` repo, `docs/palantir-llm-security-architecture.md`.
+
 ## Features
 
 What this gives a team end to end:
